@@ -308,6 +308,8 @@ void FixNVESpin::initial_integrate(int /*vflag*/)
   if (sector_flag) {                            // sectoring seq. update
     for (int j = 0; j < nsectors; j++) {        // advance quarter s for nlocal
       comm->forward_comm();
+      if (j == 0)
+        for (int k = 0; k < npairspin; k++) spin_pairs[k]->prepare_spin_update();
       int i = stack_foot[j];
       while (i >= 0) {
         const int next = forward_stacks[i];
@@ -332,6 +334,7 @@ void FixNVESpin::initial_integrate(int /*vflag*/)
     }
   } else {                                       // serial seq. update
     comm->forward_comm();                        // comm. positions of ghost atoms
+    for (int k = 0; k < npairspin; k++) spin_pairs[k]->prepare_spin_update();
     for (int i = 0; i < nlocal; i++) {           // advance quarter s for nlocal
       if (mask[i] & groupbit) {
         ComputeInteractionsSpin(i);
@@ -363,6 +366,8 @@ void FixNVESpin::initial_integrate(int /*vflag*/)
   if (sector_flag) {                            // sectoring seq. update
     for (int j = 0; j < nsectors; j++) {        // advance quarter s for nlocal
       comm->forward_comm();
+      if (j == 0)
+        for (int k = 0; k < npairspin; k++) spin_pairs[k]->prepare_spin_update();
       int i = stack_foot[j];
       while (i >= 0) {
         const int next = forward_stacks[i];
@@ -387,6 +392,7 @@ void FixNVESpin::initial_integrate(int /*vflag*/)
     }
   } else {                                      // serial seq. update
     comm->forward_comm();                       // comm. positions of ghost atoms
+    for (int k = 0; k < npairspin; k++) spin_pairs[k]->prepare_spin_update();
     for (int i = 0; i < nlocal; i++) {          // advance quarter s for nlocal-1
       if (mask[i] & groupbit) {
         ComputeInteractionsSpin(i);

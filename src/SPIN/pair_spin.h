@@ -32,6 +32,9 @@ class PairSpin : public Pair {
 
   void compute(int, int) override {}
   virtual void compute_single_pair(int, double *) {}
+  // Collective preparation after ghost coordinates are current, before a
+  // block of sequential spin updates.  Geometry stays fixed during the block.
+  virtual void prepare_spin_update() {}
   double memory_usage() override;
 
   // storing magnetic energies

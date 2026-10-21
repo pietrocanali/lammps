@@ -92,6 +92,17 @@ void PairSpinMagelec::init_style()
   if (!atom->tag_enable)
     error->all(FLERR,"Pair spin/magelec polarization requires atom IDs");
 
+  local_enabled = 0;
+  for (int i = 1; i <= atom->ntypes; i++)
+    for (int j = i; j <= atom->ntypes; j++) {
+      if (!setflag[i][j] || dynamic_pair[i][j] != LOCAL_POLARIZATION_COUPLING) continue;
+      local_enabled = 1;
+      if (i != center_shell_type || j != center_shell_type)
+        error->all(FLERR,"Spin/magelec polarization/local couples only the center shell type");
+    }
+  if (local_enabled && (!domain->xperiodic || !domain->yperiodic || !domain->zperiodic))
+    error->all(FLERR,"Spin/magelec polarization/local requires periodic bulk in all dimensions");
+
   auto *request = neighbor->add_request(this,NeighConst::REQ_FULL);
   request->set_id(1);
   request->set_cutoff_fixed(pol_cutoff);
@@ -137,6 +148,7 @@ void PairSpinMagelec::settings(int narg, char **arg)
 
 void PairSpinMagelec::coeff(int narg, char **arg)
 {
+  if (narg < 3) error->all(FLERR,"Incorrect args in pair_coeff spin/magelec command");
   if (!allocated) allocate();
 
   int ilo,ihi,jlo,jhi;
@@ -162,8 +174,9 @@ void PairSpinMagelec::coeff(int narg, char **arg)
     mey *= inorm;
     mez *= inorm;
 
-  } else if (strcmp(arg[2],"polarization") == 0) {
-    mode = POLARIZATION_COUPLING;
+  } else if (strcmp(arg[2],"polarization") == 0 || strcmp(arg[2],"polarization/local") == 0) {
+    mode = strcmp(arg[2],"polarization/local") == 0 ? LOCAL_POLARIZATION_COUPLING :
+      POLARIZATION_COUPLING;
     if (narg < 12 || strcmp(arg[5],"center") != 0 || strcmp(arg[8],"neighbors") != 0)
       error->all(FLERR,"Incorrect args in pair_coeff spin/magelec polarization command");
 
@@ -193,10 +206,26 @@ void PairSpinMagelec::coeff(int narg, char **arg)
         error->all(FLERR,"Invalid neighbor specification in pair_coeff spin/magelec polarization command");
       new_species.push_back(species);
     }
+    if (mode == LOCAL_POLARIZATION_COUPLING) {
+      if (ilo != new_center_shell || ihi != new_center_shell ||
+          jlo != new_center_shell || jhi != new_center_shell)
+        error->all(FLERR,"Spin/magelec polarization/local couples only the center shell type");
+      std::vector<int> used_types = {new_center_core,new_center_shell};
+      for (const auto &species : new_species) {
+        if (!std::isfinite(species.weight) || species.weight <= 0.0)
+          error->all(FLERR,"Spin/magelec polarization/local requires positive finite weights");
+        for (int t : {species.core_type,species.shell_type}) {
+          if (std::find(used_types.begin(),used_types.end(),t) != used_types.end())
+            error->all(FLERR,"Spin/magelec polarization/local requires distinct cell species types");
+          used_types.push_back(t);
+        }
+      }
+    }
     if (strcmp(arg[iarg],"polcut") != 0)
       error->all(FLERR,"Expected polcut in pair_coeff spin/magelec polarization command");
     const double new_pol_cutoff = utils::numeric(FLERR,arg[iarg+1],false,lmp);
-    if (rij <= 0.0 || new_pol_cutoff <= 0.0)
+    if (!std::isfinite(rij) || !std::isfinite(new_pol_cutoff) || !std::isfinite(gamma) ||
+        rij <= 0.0 || new_pol_cutoff <= 0.0)
       error->all(FLERR,"Spin/magelec cutoffs must be positive");
 
     if (dynamic_configured) {
@@ -217,7 +246,7 @@ void PairSpinMagelec::coeff(int narg, char **arg)
       dynamic_configured = 1;
     }
   } else
-    error->all(FLERR,"Expected magelec or polarization in pair_coeff spin/magelec command");
+    error->all(FLERR,"Expected magelec, polarization or polarization/local in pair_coeff spin/magelec command");
 
   int count = 0;
   for (int i = ilo; i <= ihi; i++) {
@@ -248,6 +277,10 @@ double PairSpinMagelec::init_one(int i, int j)
     error->all(FLERR, Error::NOLASTLINE,
                "All pair coeffs are not set. Status\n" + Info::get_pair_coeff_status(lmp));
 
+  if (dynamic_pair[i][j] != FIXED_COUPLING &&
+      cut_spin_magelec[i][j] > cut_spin_magelec_global)
+    error->all(FLERR,"Spin/magelec polarization pair cutoff exceeds the pair_style cutoff");
+
   ME[j][i] = ME[i][j];
   ME_mech[j][i] = ME_mech[i][j];
   v_mex[j][i] = v_mex[i][j];
@@ -257,7 +290,9 @@ double PairSpinMagelec::init_one(int i, int j)
   gamma_me[j][i] = gamma_me[i][j];
   cut_spin_magelec[j][i] = cut_spin_magelec[i][j];
 
-  return cut_spin_magelec_global;
+  // The cell stencil can extend beyond the magnetic bonds.  Advertise its
+  // range too so LAMMPS communicates all required nonmagnetic ghost atoms.
+  return dynamic_configured ? MAX(cut_spin_magelec_global,pol_cutoff) : cut_spin_magelec_global;
 }
 
 /* ----------------------------------------------------------------------
@@ -276,7 +311,7 @@ void *PairSpinMagelec::extract(const char *str, int &dim)
 }
 
 /* ----------------------------------------------------------------------
-   Build Bi-centered local dipoles.  Cores and shells are paired by their
+   Build core-centered cell dipoles.  Cores and shells are paired by their
    molecule ID; every periodic atom ID is retained only at its nearest image.
 ------------------------------------------------------------------------- */
 
@@ -303,8 +338,13 @@ void PairSpinMagelec::compute_polarization()
   const double cutsq = pol_cutoff*pol_cutoff;
 
   double local_dipole[3] = {0.0,0.0,0.0};
-  int local_centers = 0;
+  bigint local_centers = 0;
   pol_contributions.clear();
+  if (local_enabled) {
+    cell_polarization.assign(nall,{0.0,0.0,0.0});
+    cell_gradient.assign(nall,{0.0,0.0,0.0});
+    shell_center.assign(nlocal,-1);
+  }
 
   for (int center = 0; center < nlocal; center++) {
     if (type[center] != center_core_type) continue;
@@ -312,6 +352,7 @@ void PairSpinMagelec::compute_polarization()
       error->one(FLERR,"Spin/magelec polarization center atom {} has invalid molecule ID {}",
                  tag[center],molecule[center]);
     local_centers++;
+    double cell_charge = q[center];
 
     std::map<tagint,PolCandidate> nearest_by_tag;
     auto add_candidate = [&](int j) {
@@ -368,8 +409,12 @@ void PairSpinMagelec::compute_polarization()
       contribution.displacement[0] = x[index][0]-x[center][0];
       contribution.displacement[1] = x[index][1]-x[center][1];
       contribution.displacement[2] = x[index][2]-x[center][2];
-      for (int k = 0; k < 3; k++)
-        local_dipole[k] += contribution.weighted_charge*contribution.displacement[k];
+      cell_charge += contribution.weighted_charge;
+      for (int k = 0; k < 3; k++) {
+        const double dipole = contribution.weighted_charge*contribution.displacement[k];
+        local_dipole[k] += dipole;
+        if (local_enabled) cell_polarization[center][k] += dipole;
+      }
       pol_contributions.push_back(contribution);
     };
 
@@ -381,6 +426,9 @@ void PairSpinMagelec::compute_polarization()
     if (center_shells.empty())
       error->one(FLERR,"Spin/magelec polarization center atom {} expected 1 shell of type {} "
                  "but observed 0 within cutoff {}",tag[center],center_shell_type,pol_cutoff);
+    if (local_enabled && center_shells.size() != 1)
+      error->one(FLERR,"Spin/magelec polarization/local center atom {} has multiple shells with molecule ID {}",
+                 tag[center],molecule[center]);
     add_contribution(center_shells.front().index,1.0);
 
     for (const auto &species : pol_species) {
@@ -408,15 +456,25 @@ void PairSpinMagelec::compute_polarization()
           error->one(FLERR,"Spin/magelec polarization center atom {} found core atom {} but no "
                      "paired shell of type {} within cutoff {}",tag[center],core.tag,
                      species.shell_type,pol_cutoff);
+        if (local_enabled && shells.size() != 1)
+          error->one(FLERR,"Spin/magelec polarization/local core atom {} has multiple shells with molecule ID {}",
+                     core.tag,core.molecule);
+        if (local_enabled)
+          for (const auto &other : cores)
+            if (other.tag != core.tag && other.molecule == core.molecule)
+              error->one(FLERR,"Spin/magelec polarization/local molecule ID {} belongs to multiple cores",
+                         core.molecule);
         add_contribution(core.index,species.weight);
         add_contribution(shells.front().index,species.weight);
       }
     }
+    if (local_enabled && (!std::isfinite(cell_charge) || std::abs(cell_charge) > 1.0e-8))
+      error->one(FLERR,"Spin/magelec polarization/local cell at atom {} is not neutral (charge {})",
+                 tag[center],cell_charge);
   }
 
-  int global_centers;
-  MPI_Allreduce(&local_centers,&global_centers,1,MPI_INT,MPI_SUM,world);
-  if (global_centers == 0)
+  MPI_Allreduce(&local_centers,&pol_center_count,1,MPI_LMP_BIGINT,MPI_SUM,world);
+  if (pol_center_count == 0)
     error->all(FLERR,"Spin/magelec polarization found no center atoms of type {}",
                center_core_type);
 
@@ -427,6 +485,46 @@ void PairSpinMagelec::compute_polarization()
     pvector[k] = EANGSTROM_TO_C_PER_M2*local_dipole[k]/volume;
     polarization[k] = EANGSTROM_TO_C_PER_M2*global_dipole[k]/volume;
   }
+
+  if (!local_enabled) return;
+  const double conversion = EANGSTROM_TO_C_PER_M2*pol_center_count/volume;
+  for (int i = 0; i < nlocal; i++)
+    if (type[i] == center_core_type)
+      for (int k = 0; k < 3; k++) cell_polarization[i][k] *= conversion;
+
+  // First hop: cell owners -> ghost cores.  Second hop below: shell owners
+  // -> ghost shells.  A shell's spin neighbours need not have its core ghost.
+  comm->forward_comm(this);
+  std::map<tagint,std::vector<int>> centers_by_molecule;
+  for (int i = 0; i < nall; i++)
+    if (type[i] == center_core_type) centers_by_molecule[molecule[i]].push_back(i);
+  for (int i = 0; i < nlocal; i++) {
+    if (type[i] != center_shell_type) continue;
+    if (molecule[i] <= 0 || atom->sp[i][3] <= 0.0)
+      error->one(FLERR,"Spin/magelec polarization/local shell atom {} requires a positive molecule ID and spin magnitude",
+                 tag[i]);
+    int partner = -1;
+    double best = cutsq;
+    const auto entry = centers_by_molecule.find(molecule[i]);
+    if (entry != centers_by_molecule.end()) {
+      tagint core_tag = 0;
+      for (int c : entry->second) {
+        if (core_tag && tag[c] != core_tag)
+          error->one(FLERR,"Spin/magelec polarization/local molecule ID {} belongs to multiple center cores",
+                     molecule[i]);
+        core_tag = tag[c];
+        const double dx = x[c][0]-x[i][0], dy = x[c][1]-x[i][1], dz = x[c][2]-x[i][2];
+        const double rsq = dx*dx+dy*dy+dz*dz;
+        if (rsq <= best) { best = rsq; partner = c; }
+      }
+    }
+    if (partner < 0)
+      error->one(FLERR,"Spin/magelec polarization/local shell atom {} has no matching center core within polcut; check molecule IDs and ghost cutoff",
+                 tag[i]);
+    shell_center[i] = partner;
+    cell_polarization[i] = cell_polarization[partner];
+  }
+  comm->forward_comm(this);
 }
 
 
@@ -521,13 +619,24 @@ void PairSpinMagelec::compute(int eflag, int vflag)
       // compute me interaction
 
       if (rsq <= local_cut2) {
-        const int is_dynamic = dynamic_pair[itype][jtype] == POLARIZATION_COUPLING;
+        const int is_dynamic = dynamic_pair[itype][jtype] != FIXED_COUPLING;
         if (is_dynamic) {
-          double pair_gradient[3];
-          compute_dynamic_spin(i,j,eij,fmi,spj);
-          compute_dynamic_mechanical(i,j,eij,1.0/inorm,spi,spj,fi,pair_gradient,evdwl);
-          for (int k = 0; k < 3; k++) local_pol_gradient[k] += pair_gradient[k];
+          double pair_gradient[3], pij[3];
+          bond_polarization(i,j,pij);
+          compute_dynamic_spin(i,j,eij,fmi,spj,pij);
+          compute_dynamic_mechanical(i,j,eij,1.0/inorm,spi,spj,pij,fi,pair_gradient,evdwl);
+          if (dynamic_pair[itype][jtype] == LOCAL_POLARIZATION_COUPLING) {
+            // Each owned i visits all j: the half-weighted directed gradient
+            // is exactly dH/dP_i.  The j row accumulates dH/dP_j separately.
+            for (int k = 0; k < 3; k++) cell_gradient[shell_center[i]][k] += pair_gradient[k];
+          } else
+            for (int k = 0; k < 3; k++) local_pol_gradient[k] += pair_gradient[k];
           local_dynamic_energy += evdwl;
+          if (lattice_flag && vflag_atom)
+            for (int k = 0; k < 3; k++) {
+              vatom[i][k] += 0.5*evdwl;
+              vatom[j][k] += 0.5*evdwl;
+            }
           if (!lattice_flag) fi[0] = fi[1] = fi[2] = 0.0;
           if (eflag) emag[i] += evdwl;
           else if (!vflag) evdwl = 0.0;
@@ -584,6 +693,7 @@ void PairSpinMagelec::compute(int eflag, int vflag)
   }
 
   if (dynamic_configured && lattice_flag) {
+    if (local_enabled) comm->reverse_comm(this);
     double global_pol_gradient[3];
     MPI_Allreduce(local_pol_gradient,global_pol_gradient,3,MPI_DOUBLE,MPI_SUM,world);
     apply_polarization_forces(global_pol_gradient,evflag);
@@ -679,9 +789,11 @@ void PairSpinMagelec::compute_single_pair(int ii, double fmi[3])
       eij[2] = -inorm*delz;
 
       if (rsq <= local_cut2) {
-        if (dynamic_pair[itype][jtype] == POLARIZATION_COUPLING)
-          compute_dynamic_spin(ii,j,eij,fmi,spj);
-        else
+        if (dynamic_pair[itype][jtype] != FIXED_COUPLING) {
+          double pij[3];
+          bond_polarization(ii,j,pij);
+          compute_dynamic_spin(ii,j,eij,fmi,spj,pij);
+        } else
           compute_magelec(ii,j,eij,fmi,spj);
       }
     }
@@ -690,8 +802,68 @@ void PairSpinMagelec::compute_single_pair(int ii, double fmi[3])
 
 /* ---------------------------------------------------------------------- */
 
+void PairSpinMagelec::prepare_spin_update()
+{
+  if (dynamic_configured) compute_polarization();
+}
+
+/* ---------------------------------------------------------------------- */
+
+void PairSpinMagelec::bond_polarization(int i, int j, double pij[3]) const
+{
+  const int local = dynamic_pair[atom->type[i]][atom->type[j]] == LOCAL_POLARIZATION_COUPLING;
+  for (int k = 0; k < 3; k++)
+    pij[k] = local ? 0.5*(cell_polarization[i][k]+cell_polarization[j][k]) : polarization[k];
+}
+
+/* ----------------------------------------------------------------------
+   Forward cell/core and shell polarizations; reverse cell gradients only.
+   The normal LAMMPS reverse force communication handles contributor forces.
+------------------------------------------------------------------------- */
+
+int PairSpinMagelec::pack_forward_comm(int n, int *indices, double *buf, int, int *)
+{
+  int m = 0;
+  for (int i = 0; i < n; i++)
+    for (int k = 0; k < 3; k++) buf[m++] = cell_polarization[indices[i]][k];
+  return m;
+}
+
+void PairSpinMagelec::unpack_forward_comm(int n, int first, double *buf)
+{
+  int m = 0;
+  for (int i = first; i < first+n; i++)
+    for (int k = 0; k < 3; k++) cell_polarization[i][k] = buf[m++];
+}
+
+int PairSpinMagelec::pack_reverse_comm(int n, int first, double *buf)
+{
+  int m = 0;
+  for (int i = first; i < first+n; i++)
+    for (int k = 0; k < 3; k++) buf[m++] = cell_gradient[i][k];
+  return m;
+}
+
+void PairSpinMagelec::unpack_reverse_comm(int n, int *indices, double *buf)
+{
+  int m = 0;
+  for (int i = 0; i < n; i++)
+    for (int k = 0; k < 3; k++) cell_gradient[indices[i]][k] += buf[m++];
+}
+
+double PairSpinMagelec::memory_usage()
+{
+  return PairSpin::memory_usage() +
+    (cell_polarization.capacity()+cell_gradient.capacity())*sizeof(std::array<double,3>) +
+    shell_center.capacity()*sizeof(int) +
+    pol_contributions.capacity()*sizeof(PolarizationContribution) +
+    pol_species.capacity()*sizeof(PolarizationSpecies);
+}
+
+/* ---------------------------------------------------------------------- */
+
 void PairSpinMagelec::compute_dynamic_spin(int i, int j, const double eij[3], double fmi[3],
-                                           const double spj[3])
+                                           const double spj[3], const double polarization[3])
 {
   int *type = atom->type;
   const double gamma_over_hbar = gamma_me[type[i]][type[j]]/hbar;
@@ -714,6 +886,7 @@ void PairSpinMagelec::compute_dynamic_spin(int i, int j, const double eij[3], do
 
 void PairSpinMagelec::compute_dynamic_mechanical(int i, int j, const double eij[3], double r,
                                                  const double spi[3], const double spj[3],
+                                                 const double polarization[3],
                                                  double fi[3], double gradient[3], double &energy)
 {
   int *type = atom->type;
@@ -761,8 +934,10 @@ void PairSpinMagelec::apply_polarization_forces(const double gradient[3], int ta
 
   for (const auto &contribution : pol_contributions) {
     const double scale = conversion*contribution.weighted_charge;
-    const double center_force[3] =
-      {scale*gradient[0],scale*gradient[1],scale*gradient[2]};
+    double center_force[3];
+    for (int k = 0; k < 3; k++)
+      center_force[k] = scale*(gradient[k] + (local_enabled ?
+        pol_center_count*cell_gradient[contribution.center][k] : 0.0));
     for (int k = 0; k < 3; k++) {
       f[contribution.center][k] += center_force[k];
       f[contribution.atom][k] -= center_force[k];
